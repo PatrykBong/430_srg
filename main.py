@@ -24,6 +24,7 @@ class TestSession:
 session = TestSession()
 #<1> -> cmd.exe <2> -> /c curl "http://localhost:5005/start/1"
 
+# Zamiast filtorwania Sampled Values z całego ruchu Ethernetowego, przechodzę na czytanie socketu; meculpa: "ether proto 0x88ba" to jednak standard dla SV (IEEE 61850) a nie ruch ethernetowy
 def c37_worker():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) # socket.AF_INET -> IPv4; SOCK_DGRAM -> UDP
     sock.bind(("0.0.0.0", 4712)) # Poet 4712 jest takim półoficjalnym, domyślnym portem dla urządzeń Omicronu
@@ -104,8 +105,6 @@ async def stop_test():
         os.makedirs(folder, exist_ok=True)
         path = f"{folder}/pomiary.csv"
         df.to_csv(path, index=False)
-
-        #plot = create_plot()
         
         session.data_buffer = []
         return {"status": "saved", "path": path, "samples": len(df)}
