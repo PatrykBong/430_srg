@@ -4,8 +4,9 @@ import pandas as pd
 import numpy as np
 import uvicorn
 import struct
+import socket
+import threading
 from fastapi import FastAPI
-from scapy.all import sniff, Packet, conf
 
 app = FastAPI()
 
@@ -14,31 +15,69 @@ class TestSession:
         self.is_running = False
         self.current_test_id = ""
         self.data_buffer = []
+        self.num_phasors = 0 # Liczba phasorów
+        self.data_offset = 58 # Od tego bajta zaczyna się sekcja Measuurement Data w ramkach
+        self.phasor_size = 8 # 8 dla float, 4 dla int, na razie kożystamy z float, w przyszlości można to wyciągnąć z ramki konfiguracyjnej
+        self.phasor_names = []
+        self.test_list = []
 
 session = TestSession()
 #<1> -> cmd.exe <2> -> /c curl "http://localhost:5005/start/1"
-def handle_sv_packet(packet: Packet):
-    if session.is_running:
-        print("otrzymano pakiet") #do testów, nie używać, w przeciwnym razie zakomentuj linijke
-        try:
-            raw = packet.load
-            va = struct.unpack('!i', raw[0:4])[0] #sprawdzić w wiresharku
-            vb = struct.unpack('!i', raw[8:12])[0]
-            vc = struct.unpack('!i', raw[16:20])[0]
-            ia = struct.unpack('!i', raw[32:36])[0]
-            ib = struct.unpack('!i', raw[40:44])[0]
-            ic = struct.unpack('!i', raw[48:52])[0]
-            
-            session.data_buffer.append([va, vb, vc, ia, ib, ic])
-        except Exception as e:
-            pass
 
-def sniffer_worker():
-    print("📡 Sniffer: Rozpoczęto nasłuchiwanie na interfejsie...")
-    sniff(filter="ether proto 0x88ba", prn=handle_sv_packet, store=0) #z urządzeniem
-    #sniff(iface=conf.iface, prn=handle_sv_packet, store=0) #do testów lokalnie
+def c37_worker():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) # socket.AF_INET -> IPv4; SOCK_DGRAM -> UDP
+    sock.bind(("0.0.0.0", 4712)) # Poet 4712 jest takim półoficjalnym, domyślnym portem dla urządzeń Omicronu
+    print(" !!! Server: Oczekiwanie na dane z CMC 430 !!! ")
 
-threading.Thread(target=sniffer_worker, daemon=True).start()
+    while True:
+        data, addr = sock.recvfrom(2048)
+        
+        if data[0] == 0xAA:
+            frame_type = data[1] & 0x0F # Wyciągamy typ ramki z młodszych bitów
+
+            # RAMKA KONFIGURACYJNA
+            if frame_type in [1, 2, 3]:
+                try:
+                    # 1. Pobierz liczbę fazorów
+                    detected_phasors = struct.unpack('>H', data[82:84])[0]
+                    
+                    # Aktualizuj nazwy tylko jeśli liczba fazorów się zmieniła lub lista jest pusta
+                    if detected_phasors != session.num_phasors or not session.phasor_names:
+                        session.num_phasors = detected_phasors
+                        session.phasor_names = [] # Czyścimy stare nazwy
+                        
+                        for i in range(session.num_phasors):
+                            # '>16s' -> surowy ciąg znaków
+                            raw_name = struct.unpack(f'>16s', data[88 + i*16 : 88 + i*16 + 16])[0]
+                            
+                            clean_name = raw_name.decode('ascii', errors='ignore').strip()
+                            
+                            session.phasor_names.append(f"{clean_name}_Val")
+                            session.phasor_names.append(f"{clean_name}_Ang")
+                        
+                        print(f"WYKRYTO: {session.num_phasors} fazorów")
+                        
+                except Exception as e:
+                    print(f"Błąd parsowania konfiguracji: {e}")
+
+            # RAMKA DANYCH
+            elif frame_type == 0 and session.is_running:
+                # Jeśli jeszcze nie znamy liczby phasorów, pomijamy iterację pentli
+                if session.num_phasors == 0:
+                    continue 
+
+                try:
+                    current_sample = []
+                    # Iterujemy po wykrytej liczbie fazorów
+                    for i in range(session.num_phasors):
+                        start = session.data_offset + (i * session.phasor_size)
+                        # Wyciągamy Value i Angle dla każdego phasora
+                        val, ang = struct.unpack('>ff', data[start : start + session.phasor_size])
+                        current_sample.extend([val, ang])
+                    
+                    session.data_buffer.append(current_sample)
+                except Exception:
+                    pass
 
 @app.get("/start/{test_id}")
 async def start_test(test_id: str):
@@ -54,9 +93,13 @@ async def stop_test():
     print(f"STOP: Przetwarzanie danych dla testu {session.current_test_id}")
 
     if session.data_buffer:
-        data_array = np.array(session.data_buffer)
-        df = pd.DataFrame(data_array, columns=['Va', 'Vb', 'Vc', 'Ia', 'Ib', 'Ic'])
+        # Można dodać zabezpieczenie jeżeli byłby problem z wczytaniem nazw z session.phasor_names na zasadzie ręcznego nadania im nazw
+        df = pd.DataFrame(session.data_buffer, columns=session.phasor_names)
         
+        # Dodanie id testu do listy w celu wczytania testów z plików na samym końcu podczas generowannia pdf
+        session.test_list.append((session.current_test_id))
+
+        # Zapis do pliku CSV
         folder = f"./wyniki/{session.current_test_id}"
         os.makedirs(folder, exist_ok=True)
         path = f"{folder}/pomiary.csv"
@@ -69,9 +112,16 @@ async def stop_test():
     
     return {"status": "no_data"}
 
+@app.get("/finish")
+async def finish_tests():
+    # End point wywoływany po zakończeniu wszystkich testów
+    # W tym miejscu będzie następowało wczytanie danych z plików CSV, przerobienie danych do wykresów i wygenerowanie PDF
+    return {"status": "ok"}
+
 def create_plot():
     return 0
 
 if __name__ == "__main__":
+    threading.Thread(target=c37_worker, daemon=True).start()
     uvicorn.run(app, host="127.0.0.1", port=5005)
 #py -m uvicorn main:app --reload --port 5005
