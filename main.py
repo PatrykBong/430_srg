@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import numpy as np
 
+from config import PORT
+
 app = FastAPI()
 
 class TestSession:
@@ -35,7 +37,7 @@ session = TestSession()
 # Zamiast filtorwania Sampled Values z całego ruchu Ethernetowego, przechodzę na czytanie socketu; meculpa: "ether proto 0x88ba" to jednak standard dla SV (IEEE 61850) a nie ruch ethernetowy
 def c37_worker():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM) # socket.AF_INET -> IPv4; SOCK_DGRAM -> UDP
-    sock.bind(("0.0.0.0", 4712)) # Poet 4712 jest takim półoficjalnym, domyślnym portem dla urządzeń Omicronu
+    sock.bind(("0.0.0.0", PORT or 4713)) # Patrz Wireshark, później przenieść to do init
     print(" !!! Server: Oczekiwanie na dane z CMC 430 !!! ")
 
     while True:
@@ -82,6 +84,7 @@ def c37_worker():
                             av_offset = analog_start_offset + (i * 16)
                             raw_name = struct.unpack(f'>16s', data[av_offset : av_offset + 16])[0]
                             clean_name = raw_name.decode('ascii', errors='ignore').strip()
+                            session.analog_values_names.append(clean_name)
                         
                         print(f"WYKRYTO: {session.num_phasors} fazorów")
                         
